@@ -1,0 +1,361 @@
+---
+# Deploy Gotenberg (https://gotenberg.dev) on Ubuntu 24.04 LTS behind
+# nginx + Let's Encrypt TLS on a fixed domain, reachable only from an IP allow-list.
+#
+# Architecture
+#   client --443/TLS--> nginx (host) --> 127.0.0.1:3000 (Gotenberg in Docker)
+#   * 443 : only allowed_ips (enforced by UFW *and* nginx)
+#   * 80  : open to everyone, but only serves the ACME challenge + redirect to
+#           HTTPS (Let's Encrypt validates from many IPs, so it can't be IP-limited
+#           when using the HTTP-01 challenge)
+#   * Gotenberg itself is bound to localhost only, so Docker can't bypass the firewall.
+#
+# Prerequisites
+#   * DNS A (and AAAA, if used) record for gotenberg_domain -> the server's public IP
+#   * ansible-galaxy collection install community.docker community.general
+#
+# Run:
+#   ansible-playbook -i inventory.ini deploy-gotenberg.yml
+# (set gotenberg_domain / letsencrypt_email in inventory.ini, the rest in group_vars/gotenberg.yml)
+
+- name: Deploy Gotenberg with Let's Encrypt TLS
+  hosts: gotenberg
+  become: true
+
+  vars:
+    # User-editable settings live in inventory.ini ([gotenberg:vars]) and
+    # group_vars/gotenberg.yml (play-level vars would override those, so none are set here).
+
+    docker_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+    acme_webroot: /var/www/certbot
+    cert_dir: "/etc/letsencrypt/live/{{ gotenberg_domain }}"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - allowed_ips | length > 0
+          - gotenberg_domain is defined and gotenberg_domain | length > 0
+          - letsencrypt_email is defined and letsencrypt_email | length > 0
+        fail_msg: "Set gotenberg_domain and letsencrypt_email in inventory.ini and at least one entry in allowed_ips in group_vars/gotenberg.yml."
+
+  tasks:
+    # ---------------------------------------------------------------- Packages
+    - name: Install prerequisites, nginx and certbot
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - ufw
+          - nginx
+          - certbot
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ------------------------------------------------------------------ Docker
+    - name: Add Docker apt repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/ubuntu
+        suites: "{{ ansible_distribution_release }}"
+        components: stable
+        architectures: "{{ docker_arch }}"
+        signed_by: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Install Docker Engine and Python Docker SDK
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - python3-docker
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # ---------------------------------------------------------------- Gotenberg
+    - name: Pull Gotenberg image
+      community.docker.docker_image:
+        name: "{{ gotenberg_image }}"
+        tag: "{{ gotenberg_tag }}"
+        source: pull
+        force_source: "{{ gotenberg_tag in ['latest', '8'] }}"
+
+    - name: Run Gotenberg container (bound to localhost only)
+      community.docker.docker_container:
+        name: gotenberg
+        image: "{{ gotenberg_image }}:{{ gotenberg_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "127.0.0.1:{{ gotenberg_local_port }}:3000"
+        env: "{{ gotenberg_env }}"
+        command: "{{ ['gotenberg'] + gotenberg_extra_args }}"
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+          interval: 30s
+          timeout: 5s
+          retries: 3
+          start_period: 10s
+        security_opts:
+          - no-new-privileges
+      vars:
+        gotenberg_env: >-
+          {{ {'GOTENBERG_API_BASIC_AUTH_USERNAME': gotenberg_basic_auth_user,
+              'GOTENBERG_API_BASIC_AUTH_PASSWORD': gotenberg_basic_auth_password}
+             if gotenberg_basic_auth_user | length > 0 else {} }}
+      no_log: "{{ gotenberg_basic_auth_user | length > 0 }}"
+
+    # --------------------------------------------- Clean up the old iptables ACL
+    # (only relevant if an earlier version of this playbook was applied)
+    - name: Stop and disable legacy gotenberg-acl service
+      ansible.builtin.systemd:
+        name: gotenberg-acl
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove legacy ACL iptables rules
+      ansible.builtin.shell: |
+        while iptables -D DOCKER-USER -i {{ ansible_default_ipv4.interface }} -p tcp -m conntrack --ctorigdstport 3000 -j GOTENBERG-ACL 2>/dev/null; do :; done
+        iptables -F GOTENBERG-ACL 2>/dev/null || true
+        iptables -X GOTENBERG-ACL 2>/dev/null || true
+      changed_when: false
+
+    - name: Remove legacy ACL files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/sbin/gotenberg-acl.sh
+        - /etc/systemd/system/gotenberg-acl.service
+
+    # ----------------------------------------------------------------- Firewall
+    - name: UFW - default deny incoming
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: UFW - default allow outgoing
+      community.general.ufw:
+        default: allow
+        direction: outgoing
+
+    - name: UFW - allow SSH from anywhere (rate limited)
+      community.general.ufw:
+        rule: limit
+        port: "{{ ssh_port }}"
+        proto: tcp
+      when: ssh_allowed_ips | length == 0
+
+    - name: UFW - allow SSH from specific IPs
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+        from_ip: "{{ item }}"
+      loop: "{{ ssh_allowed_ips }}"
+
+    - name: UFW - allow HTTP (ACME challenge + redirect) from anywhere
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: UFW - allow HTTPS only from allowed IPs
+      community.general.ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+        from_ip: "{{ item }}"
+      loop: "{{ allowed_ips }}"
+
+    - name: UFW - remove legacy rule for port 3000
+      community.general.ufw:
+        rule: allow
+        port: "3000"
+        proto: tcp
+        from_ip: "{{ item }}"
+        delete: true
+      loop: "{{ allowed_ips }}"
+
+    - name: UFW - enable
+      community.general.ufw:
+        state: enabled
+
+    # ------------------------------------------------- nginx + Let's Encrypt
+    - name: Create ACME webroot
+      ansible.builtin.file:
+        path: "{{ acme_webroot }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Check whether certificate already exists
+      ansible.builtin.stat:
+        path: "{{ cert_dir }}/fullchain.pem"
+      register: cert_stat
+
+    - name: Install HTTP-only vhost if no certificate yet
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/gotenberg.conf
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name {{ gotenberg_domain }};
+
+              location /.well-known/acme-challenge/ {
+                  root {{ acme_webroot }};
+              }
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+      when: not cert_stat.stat.exists
+      notify: Reload nginx
+
+    - name: Enable nginx vhost
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/gotenberg.conf
+        dest: /etc/nginx/sites-enabled/gotenberg.conf
+        state: link
+
+    - name: Ensure nginx is running with the current config
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Reload nginx now (before requesting certificate)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Obtain Let's Encrypt certificate (webroot challenge)
+      ansible.builtin.command:
+        argv: >-
+          {{ ['certbot', 'certonly', '--webroot', '-w', acme_webroot,
+              '-d', gotenberg_domain, '--email', letsencrypt_email,
+              '--agree-tos', '--non-interactive', '--no-eff-email']
+             + (['--staging'] if letsencrypt_staging else []) }}
+        creates: "{{ cert_dir }}/fullchain.pem"
+
+    - name: Reload nginx automatically after certificate renewals
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          systemctl reload nginx
+
+    - name: Ensure certbot renewal timer is enabled
+      ansible.builtin.systemd:
+        name: certbot.timer
+        state: started
+        enabled: true
+
+    - name: Install final HTTPS nginx vhost
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/gotenberg.conf
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name {{ gotenberg_domain }};
+
+              location /.well-known/acme-challenge/ {
+                  root {{ acme_webroot }};
+              }
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+
+          server {
+              # nginx 1.24 (Ubuntu 24.04) enables HTTP/2 on the listen line;
+              # the separate `http2 on;` directive needs nginx >= 1.25.1
+              listen 443 ssl http2;
+              listen [::]:443 ssl http2;
+              server_name {{ gotenberg_domain }};
+
+              ssl_certificate     {{ cert_dir }}/fullchain.pem;
+              ssl_certificate_key {{ cert_dir }}/privkey.pem;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              ssl_session_cache   shared:SSL:10m;
+              ssl_session_timeout 1d;
+              ssl_session_tickets off;
+
+              add_header Strict-Transport-Security "max-age=31536000" always;
+
+              # Defence in depth: same allow-list as the firewall (+ localhost for health checks)
+              allow 127.0.0.1;
+              allow ::1;
+          {% for ip in allowed_ips %}
+              allow {{ ip }};
+          {% endfor %}
+              deny all;
+
+              client_max_body_size {{ nginx_max_body_size }};
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ gotenberg_local_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $remote_addr;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_read_timeout {{ nginx_proxy_timeout }};
+                  proxy_send_timeout {{ nginx_proxy_timeout }};
+                  proxy_request_buffering off;
+              }
+          }
+      notify: Reload nginx
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Apply nginx configuration
+      ansible.builtin.meta: flush_handlers
+
+    # ------------------------------------------------------------------- Verify
+    - name: Verify Gotenberg through nginx over HTTPS (resolved locally)
+      ansible.builtin.command:
+        argv: >-
+          {{ ['curl', '-fsS'] + (['-k'] if letsencrypt_staging else [])
+             + ['--resolve', gotenberg_domain + ':443:127.0.0.1',
+                'https://' + gotenberg_domain + '/health'] }}
+      register: health
+      retries: 15
+      delay: 3
+      until: health.rc == 0
+      changed_when: false
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: >-
+          Gotenberg is available at https://{{ gotenberg_domain }}
+          (allowed: {{ allowed_ips | join(', ') }})
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

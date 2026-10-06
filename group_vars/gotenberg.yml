@@ -1,0 +1,14 @@
+---
+# note: group_vars override inventory variables so remove from here if something set in inventory
+
+letsencrypt_staging: false                # true = test against LE staging (untrusted cert, no rate limits)
+ssh_port: 22
+gotenberg_image: gotenberg/gotenberg
+gotenberg_tag: "8"                        # pin an exact version for reproducibility
+gotenberg_local_port: 3000                # localhost-only port used by nginx
+gotenberg_extra_args:
+  - --api-timeout=60s
+gotenberg_basic_auth_user: ""             # optional API basic auth
+gotenberg_basic_auth_password: ""
+nginx_max_body_size: 100m                 # max upload size (documents sent for conversion)
+nginx_proxy_timeout: 120s
