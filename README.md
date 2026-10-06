@@ -4,8 +4,8 @@ Architecture: `client --443/TLS--> nginx --> 127.0.0.1:3000 (Gotenberg, Docker)`
 
 1. Create a DNS record for your domain pointing at the server.
 2. On your local workstation: `ansible-galaxy collection install community.docker community.general`
-3. In `inventory.ini` set the host plus `gotenberg_domain` and `letsencrypt_email` (under `[gotenberg:vars]`); edit `allowed_ips` and other options in `group_vars/gotenberg.yml`.
-4. `ansible-playbook -i inventory.ini deploy-gotenberg.yml`
+3. Copy `inventory-example.yml` to e.g. `inventory.yml` and set needed variables (IPs and domain and Let's Encrypt email)
+4. `ansible-playbook -i inventory.yml deploy-gotenberg.yml`
 
 Test from an allowed IP:
 
