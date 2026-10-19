@@ -13,3 +13,6 @@ all:
         ssh_allowed_ips:                          # [] = SSH open to all; or e.g. ["198.51.100.7"]
           - 1.2.3.4
           - 2.3.4.5
+        restart_daily: true  # setup daily restart docker container cron job
+
+
